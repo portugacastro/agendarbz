@@ -41,6 +41,7 @@ export function AgendamentoForm({ agendamento, gestorAtual, isAdmin }: Props) {
   const [buscaCliente, setBuscaCliente] = useState(agendamento?.clientes?.nome || '')
   const [clientesResultado, setClientesResultado] = useState<Cliente[]>([])
   const [showClienteDropdown, setShowClienteDropdown] = useState(false)
+  const [clientesDaSelecao, setClientesDaSelecao] = useState<Cliente[]>([])
 
   // Modal de novo lead
   const [showLeadModal, setShowLeadModal] = useState(false)
@@ -92,29 +93,83 @@ export function AgendamentoForm({ agendamento, gestorAtual, isAdmin }: Props) {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  async function buscarClientes(q: string) {
-    if (q.length < 2) { setClientesResultado([]); return }
+  // Pré-carrega clientes da marca ou do gestor selecionado em ordem alfabética
+  useEffect(() => {
+    if (form.cliente_id) return // já tem cliente selecionado, não recarrega
 
-    if (form.marca_id) {
-      // Filtra clientes vinculados à marca via cliente_marcas
-      const { data } = await supabase
-        .from('clientes')
-        .select('id, nome, fantasia, cidade, uf, cliente_marcas!inner(marca_id)')
-        .eq('status', 'ativo')
-        .eq('cliente_marcas.marca_id', form.marca_id)
-        .ilike('nome', `%${q}%`)
-        .limit(10)
-      setClientesResultado((data as any[]) || [])
-    } else {
-      // Sem marca selecionada: busca todos
-      const { data } = await supabase
-        .from('clientes')
-        .select('id, nome, fantasia, cidade, uf')
-        .eq('status', 'ativo')
-        .ilike('nome', `%${q}%`)
-        .limit(10)
-      setClientesResultado((data as Cliente[]) || [])
+    async function preCarregarClientes() {
+      if (form.marca_id) {
+        const { data: cm } = await supabase
+          .from('cliente_marcas')
+          .select('cliente_id')
+          .eq('marca_id', form.marca_id)
+        const ids = (cm || []).map(r => r.cliente_id)
+        if (ids.length === 0) { setClientesDaSelecao([]); return }
+
+        const { data } = await supabase
+          .from('clientes')
+          .select('id, nome, fantasia, cidade, uf')
+          .eq('status', 'ativo')
+          .in('id', ids)
+          .order('nome')
+        setClientesDaSelecao((data as Cliente[]) || [])
+        return
+      }
+
+      if (form.gestor_id) {
+        const marcasDoGestor = todasMarcas
+          .filter(m => m.gestor_id === form.gestor_id)
+          .map(m => m.id)
+        if (marcasDoGestor.length === 0) { setClientesDaSelecao([]); return }
+
+        const { data: cm } = await supabase
+          .from('cliente_marcas')
+          .select('cliente_id')
+          .in('marca_id', marcasDoGestor)
+        const ids = [...new Set((cm || []).map(r => r.cliente_id))]
+        if (ids.length === 0) { setClientesDaSelecao([]); return }
+
+        const { data } = await supabase
+          .from('clientes')
+          .select('id, nome, fantasia, cidade, uf')
+          .eq('status', 'ativo')
+          .in('id', ids)
+          .order('nome')
+        setClientesDaSelecao((data as Cliente[]) || [])
+        return
+      }
+
+      setClientesDaSelecao([])
     }
+
+    preCarregarClientes()
+  }, [form.marca_id, form.gestor_id, todasMarcas])
+
+  function filtrarLocalmente(q: string) {
+    const qLow = q.toLowerCase()
+    const result = q
+      ? clientesDaSelecao.filter(c =>
+          c.nome.toLowerCase().includes(qLow) ||
+          (c.fantasia || '').toLowerCase().includes(qLow)
+        )
+      : clientesDaSelecao
+    setClientesResultado(result.slice(0, 60))
+  }
+
+  async function buscarClientes(q: string) {
+    if (clientesDaSelecao.length > 0) {
+      filtrarLocalmente(q)
+      return
+    }
+    if (q.length < 2) { setClientesResultado([]); return }
+    const { data } = await supabase
+      .from('clientes')
+      .select('id, nome, fantasia, cidade, uf')
+      .eq('status', 'ativo')
+      .or(`nome.ilike.%${q}%,fantasia.ilike.%${q}%`)
+      .order('nome')
+      .limit(20)
+    setClientesResultado((data as Cliente[]) || [])
   }
 
   async function selectCliente(c: Cliente) {
@@ -149,14 +204,15 @@ export function AgendamentoForm({ agendamento, gestorAtual, isAdmin }: Props) {
     setForm(f => ({ ...f, cliente_id: '', marca_id: '' }))
     setBuscaCliente('')
     setClientesResultado([])
+    setClientesDaSelecao([])
     setMarcasFiltradas(todasMarcas)
   }
 
-  // Quando muda a marca, limpa o cliente selecionado para forçar nova busca
   function handleMarcaChange(marcaId: string) {
     setForm(f => ({ ...f, marca_id: marcaId, cliente_id: '' }))
     setBuscaCliente('')
     setClientesResultado([])
+    setClientesDaSelecao([])
   }
 
   async function handleSaveLead(e: React.FormEvent) {
@@ -274,16 +330,28 @@ export function AgendamentoForm({ agendamento, gestorAtual, isAdmin }: Props) {
                   onChange={(e) => {
                     setBuscaCliente(e.target.value)
                     setShowClienteDropdown(true)
-                    if (!form.cliente_id) buscarClientes(e.target.value)
-                    else clearCliente()
+                    if (form.cliente_id) clearCliente()
+                    buscarClientes(e.target.value)
                   }}
-                  onFocus={() => { setShowClienteDropdown(true); if (!form.cliente_id) buscarClientes(buscaCliente) }}
-                  placeholder={form.marca_id ? 'Buscar cliente da marca selecionada...' : 'Selecione a marca ou busque qualquer cliente...'}
+                  onFocus={() => {
+                    setShowClienteDropdown(true)
+                    if (!form.cliente_id) {
+                      if (clientesDaSelecao.length > 0) filtrarLocalmente(buscaCliente)
+                      else if (buscaCliente.length >= 2) buscarClientes(buscaCliente)
+                    }
+                  }}
+                  placeholder={
+                    form.marca_id
+                      ? `Buscar cliente da marca ${todasMarcas.find(m => m.id === form.marca_id)?.nome || ''}...`
+                      : form.gestor_id && clientesDaSelecao.length > 0
+                        ? `Buscar entre ${clientesDaSelecao.length} clientes do gestor...`
+                        : 'Selecione a marca ou busque qualquer cliente...'
+                  }
                   className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-300 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                 />
 
                 {/* Dropdown de resultados */}
-                {showClienteDropdown && clientesResultado.length > 0 && (
+                {showClienteDropdown && !form.cliente_id && clientesResultado.length > 0 && (
                   <div className="absolute top-full left-0 right-0 z-30 mt-1 bg-white rounded-xl border border-slate-200 shadow-xl overflow-hidden">
                     <div className="max-h-56 overflow-y-auto divide-y divide-slate-100">
                       {clientesResultado.map(c => (
@@ -306,7 +374,7 @@ export function AgendamentoForm({ agendamento, gestorAtual, isAdmin }: Props) {
                 )}
 
                 {/* Nenhum resultado */}
-                {showClienteDropdown && buscaCliente.length >= 2 && clientesResultado.length === 0 && !form.cliente_id && (
+                {showClienteDropdown && buscaCliente.length >= 2 && clientesResultado.length === 0 && !form.cliente_id && clientesDaSelecao.length === 0 && (
                   <div className="absolute top-full left-0 right-0 z-30 mt-1 bg-white rounded-xl border border-slate-200 shadow-xl px-4 py-3">
                     <p className="text-sm text-slate-500">
                       Nenhum cliente encontrado.{' '}
@@ -368,44 +436,29 @@ export function AgendamentoForm({ agendamento, gestorAtual, isAdmin }: Props) {
             <Select label="Tipo *" value={form.tipo} onChange={(e) => set('tipo', e.target.value)} options={TIPO_OPTIONS} required />
             <Select label="Canal" value={form.canal} onChange={(e) => set('canal', e.target.value)} options={CANAL_OPTIONS} placeholder="Selecione o canal" />
             <Input label="Objetivo" value={form.objetivo} onChange={(e) => set('objetivo', e.target.value)} placeholder="Objetivo do contato" />
-          </div>
-        </Card>
-
-        {/* Status e Resultado */}
-        <Card>
-          <h2 className="font-semibold text-slate-900 mb-4">Status e Resultado</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Select label="Status *" value={form.status} onChange={(e) => set('status', e.target.value)} options={STATUS_OPTIONS} required />
-            <Select label="Resultado" value={form.resultado} onChange={(e) => set('resultado', e.target.value)} options={RESULTADO_OPTIONS} placeholder="Selecione o resultado" />
-          </div>
-        </Card>
-
-        {/* Detalhes */}
-        <Card>
-          <h2 className="font-semibold text-slate-900 mb-4">Detalhes</h2>
-          <div className="space-y-4">
-            <div>
-              <label className="text-sm font-medium text-slate-700 block mb-1">Assunto</label>
-              <input
-                type="text"
-                value={form.assunto}
-                onChange={(e) => set('assunto', e.target.value)}
-                placeholder="Assunto da agenda"
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-              />
-            </div>
-            <div>
+            <div className="lg:col-span-3">
               <label className="text-sm font-medium text-slate-700 block mb-1">Observações</label>
               <textarea
                 value={form.observacoes}
                 onChange={(e) => set('observacoes', e.target.value)}
-                rows={4}
+                rows={3}
                 placeholder="Observações sobre o agendamento..."
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none"
               />
             </div>
           </div>
         </Card>
+
+        {/* Status e Resultado — só na edição */}
+        {agendamento && (
+          <Card>
+            <h2 className="font-semibold text-slate-900 mb-4">Status e Resultado</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <Select label="Status *" value={form.status} onChange={(e) => set('status', e.target.value)} options={STATUS_OPTIONS} required />
+              <Select label="Resultado" value={form.resultado} onChange={(e) => set('resultado', e.target.value)} options={RESULTADO_OPTIONS} placeholder="Selecione o resultado" />
+            </div>
+          </Card>
+        )}
 
         <div className="flex gap-3">
           <Button type="submit" loading={loading}>
